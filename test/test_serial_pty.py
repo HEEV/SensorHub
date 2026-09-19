@@ -28,10 +28,10 @@ PAYLOAD_SIZE = 36
 
 def frame(speed, airspeed, temps, analog, digital_in, digital_out, sequence,
           fmt=FORMAT_V1):
-    """Build one 41-byte frame.
+    """Build one 42-byte frame.
 
-    0xAA 0x55, format, length, 36-byte payload, XOR checksum over the
-    format and length bytes as well as the payload.
+    0xAA 0x55, format, length, 36-byte payload, then a little-endian
+    CRC-16-CCITT covering the format and length bytes as well as the payload.
     """
     payload = struct.pack(
         "<ff4f4HBBH", speed, airspeed, *temps, *analog,
@@ -42,11 +42,26 @@ def frame(speed, airspeed, temps, analog, digital_in, digital_out, sequence,
     )
 
     header = bytes([fmt, len(payload)])
-    checksum = 0
-    for byte in header + payload:
-        checksum ^= byte
+    crc = crc16_ccitt(header + payload)
 
-    return bytes([0xAA, 0x55]) + header + payload + bytes([checksum])
+    return (bytes([0xAA, 0x55]) + header + payload
+            + bytes([crc & 0xFF, (crc >> 8) & 0xFF]))
+
+
+def crc16_ccitt(data):
+    """CRC-16-CCITT, poly 0x1021, init 0xFFFF. Check value for b"123456789"
+    is 0x29B1; asserted below so a typo here cannot masquerade as a firmware
+    bug."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 \
+                else (crc << 1) & 0xFFFF
+    return crc
+
+
+assert crc16_ccitt(b"123456789") == 0x29B1, "CRC implementation is wrong"
 
 
 def main():
@@ -69,7 +84,7 @@ def main():
     os.write(master, frame(23.5, 19.25, sequence=1, **good))
     time.sleep(0.2)
 
-    # Line noise, then a frame with a deliberately corrupted checksum.
+    # Line noise, then a frame with a deliberately corrupted CRC.
     os.write(master, b"\x00\xff\xde\xad\xbe\xef")
     corrupt = bytearray(frame(11.0, 2.0, sequence=2, **good))
     corrupt[-1] ^= 0xFF
@@ -78,7 +93,8 @@ def main():
 
     # A packet from a "newer" sender. The length byte must let the receiver
     # skip it and stay framed rather than desynchronising.
-    future = bytes([0xAA, 0x55, 0x02, 50]) + bytes(range(50)) + bytes([0x00])
+    future = (bytes([0xAA, 0x55, 0x02, 50]) + bytes(range(50))
+              + bytes([0x00, 0x00]))
     os.write(master, future)
     time.sleep(0.2)
 
@@ -111,7 +127,7 @@ def main():
     if "ok=2" not in out:
         failures.append("expected exactly 2 accepted packets")
     if "bad=1" not in out:
-        failures.append("corrupt packet was not counted as a checksum error")
+        failures.append("corrupt packet was not counted as a CRC error")
     if "fmt=1" not in out:
         failures.append("packet from a newer sender was not counted as an "
                         "unknown format")

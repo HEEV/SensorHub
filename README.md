@@ -8,10 +8,10 @@ packet, the checksum, and the frame encoder.
 
 ## The wire format
 
-Forty-one bytes per frame, 115200 baud, 8N1:
+Forty-two bytes per frame, 115200 baud, 8N1:
 
 ```
-0xAA 0x55  fmt  len  payload[len]  checksum
+0xAA 0x55  fmt  len  payload[len]  crc16_lo crc16_hi
 ```
 
 | field | size | purpose |
@@ -20,7 +20,7 @@ Forty-one bytes per frame, 115200 baud, 8N1:
 | `fmt` | 1 | format version, currently `0x01` |
 | `len` | 1 | payload length, currently 36 |
 | payload | `len` | `sh_packet_t` |
-| `checksum` | 1 | XOR of `fmt`, `len`, and every payload byte |
+| `crc16` | 2 | CRC-16-CCITT over `fmt`, `len`, payload; little-endian |
 
 **The version and length bytes earn their keep.** Without a version, changing
 what a field *means* while keeping the packet the same size still passes the
@@ -31,8 +31,29 @@ newer sender desynchronises instead of skipping one packet and carrying on.
 
 Two bytes on a link running at 7% utilisation is a good trade.
 
-The checksum deliberately covers `fmt` and `len` as well as the payload, so a
+The CRC deliberately covers `fmt` and `len` as well as the payload, so a
 corrupted length byte cannot quietly reframe the stream and still validate.
+
+### Why a CRC and not a byte sum
+
+An XOR checksum is one byte cheaper and misses two corruptions a car
+produces for real. Measured over two million corrupted frames:
+
+| corruption | XOR-8 undetected | CRC-16 undetected |
+|---|---|---|
+| single bit flip | 0% | 0% |
+| **two flips, same bit position** | **100%** | 0% |
+| 8-bit burst | 0% | 0% |
+| 16-bit burst | 0.39% | 0% |
+| **two bytes swapped** | **100%** | 0% |
+
+Those two 100% rows are structural, not unlucky: paired flips in the same bit
+position cancel exactly under XOR, and an order-independent sum cannot see a
+swap. The first is what a ground bounce or a supply glitch on one data line
+produces, which is to say what an ignition system produces.
+
+CRC-16-CCITT costs 32 bytes of flash on an ATmega328p and one byte on a wire
+running at 7% utilisation. The tests assert all three cases directly.
 
 ### Payload, format 1
 
@@ -292,7 +313,8 @@ From `<sensorhub/sensorhub.h>`, portable everywhere including AVR:
 void        sh_parser_init  (sh_parser_t *parser);
 sh_status_t sh_parser_feed  (sh_parser_t *parser, uint8_t byte,
                              sh_packet_t *out);
-uint8_t     sh_checksum     (const uint8_t *data, size_t length);
+uint16_t    sh_crc16        (const uint8_t *data, size_t length);
+uint16_t    sh_crc16_continue(uint16_t crc, const uint8_t *data, size_t n);
 sh_status_t sh_encode_frame (const sh_packet_t *packet, uint8_t *buffer,
                              size_t buffer_size, size_t *written);
 

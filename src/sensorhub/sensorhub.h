@@ -4,13 +4,19 @@
  *
  * FRAME
  *
- *     0xAA 0x55  fmt  len  payload[len]  checksum
+ *     0xAA 0x55  fmt  len  payload[len]  crc16_lo crc16_hi
  *
- *   fmt       format version. A receiver refuses anything it does not know
- *             rather than decoding it confidently and wrongly.
- *   len       payload length. Lets an old receiver skip a packet from a newer
- *             sender and stay framed, instead of desynchronising.
- *   checksum  XOR of fmt, len, and every payload byte.
+ *   fmt    format version. A receiver refuses anything it does not know
+ *          rather than decoding it confidently and wrongly.
+ *   len    payload length. Lets an old receiver skip a packet from a newer
+ *          sender and stay framed, instead of desynchronising.
+ *   crc16  CRC-16-CCITT over fmt, len, and the payload, little-endian.
+ *
+ * The CRC is not a byte-sum. An XOR checksum misses two corruptions that a
+ * car produces for real: two bit flips in the same bit position cancel
+ * exactly, and swapped bytes are invisible to an order-independent sum. Both
+ * were measured at 100% undetected. CRC-16 catches both, plus every burst up
+ * to 16 bits, for 32 bytes of flash on an ATmega328p.
  *
  * The version and length bytes are the difference between "we changed the
  * format and everything broke loudly" and "we changed the format and the car
@@ -87,8 +93,8 @@ typedef struct __attribute__((packed)) {
     uint16_t sequence;
 } sh_packet_t;
 
-#define SH_PAYLOAD_SIZE 36u /* sizeof(sh_packet_t) for SH_FORMAT_V1 */
-#define SH_FRAME_OVERHEAD 5u /* 2 header + fmt + len + checksum */
+#define SH_PAYLOAD_SIZE 36u  /* sizeof(sh_packet_t) for SH_FORMAT_V1 */
+#define SH_FRAME_OVERHEAD 6u /* 2 header + fmt + len + 2 CRC */
 #define SH_FRAME_SIZE (SH_PAYLOAD_SIZE + SH_FRAME_OVERHEAD)
 
 /* The largest payload the parser will buffer. Bigger than V1 on purpose, so
@@ -119,7 +125,7 @@ typedef enum {
     SH_OK = 0,       /* a packet is ready                          */
     SH_INCOMPLETE,   /* byte consumed, nothing complete yet        */
     SH_E_NULL,       /* a required argument was NULL               */
-    SH_E_CHECKSUM,   /* framed correctly, contents rejected        */
+    SH_E_CHECKSUM,   /* framed correctly, CRC rejected it         */
     SH_E_FORMAT,     /* fmt byte names a version we do not know    */
     SH_E_LENGTH,     /* len disagrees with fmt, or exceeds the max */
     SH_E_RANGE,      /* a channel index was out of bounds          */
@@ -226,7 +232,8 @@ typedef enum {
     SH_READ_FORMAT,
     SH_READ_LENGTH,
     SH_READ_PAYLOAD,
-    SH_READ_CHECKSUM,
+    SH_READ_CRC_LO,
+    SH_READ_CRC_HI,
     SH_SKIP_UNKNOWN /* draining a packet whose format we do not know */
 } sh_state_t;
 
@@ -236,6 +243,7 @@ typedef struct {
     uint8_t    length;
     uint8_t    payload[SH_MAX_PAYLOAD];
     size_t     payload_index;
+    uint8_t    crc_lo;
     bool       have_sequence;
     uint16_t   last_sequence;
     sh_stats_t stats;
@@ -265,8 +273,20 @@ sh_status_t sh_parser_feed(sh_parser_t *parser, uint8_t byte,
  *  Encoding
  * ------------------------------------------------------------------ */
 
-/* XOR of every byte. Exposed so tests and senders need not duplicate it. */
-uint8_t sh_checksum(const uint8_t *data, size_t length);
+/*
+ * CRC-16-CCITT, polynomial 0x1021, initial value 0xFFFF, no final xor.
+ *
+ * Exposed so tests and any other transmitter need not duplicate it. The
+ * bitwise form is deliberate: a 256-entry table would be faster and cost 512
+ * bytes of flash on a part that has 30KB, to save time this loop does not
+ * need at 20 packets a second.
+ */
+uint16_t sh_crc16(const uint8_t *data, size_t length);
+
+/* Resume a CRC over a second run of bytes. Lets the receiver cover the
+   format and length fields and then the payload without copying them into
+   one contiguous buffer first. */
+uint16_t sh_crc16_continue(uint16_t crc, const uint8_t *data, size_t length);
 
 /*
  * Serialise a packet into a complete frame.

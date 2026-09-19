@@ -119,8 +119,10 @@ jobs:
           check "stopped counting dropped packets"
           sed -i 's/gap < 1000u/gap < 65535u/' src/sensorhub/parser.c
           check "treated a sender restart as a flood of drops"
-          sed -i 's/sh_checksum(buffer + 2, SH_PAYLOAD_SIZE + 2u)/sh_checksum(buffer + 4, SH_PAYLOAD_SIZE)/' src/sensorhub/parser.c
-          check "checksummed the payload only, not fmt and len"
+          sed -i 's/sh_crc16(buffer + 2, SH_PAYLOAD_SIZE + 2u)/sh_crc16(buffer + 4, SH_PAYLOAD_SIZE)/' src/sensorhub/parser.c
+          check "covered the payload only, not fmt and len"
+          sed -i 's|crc ^= (uint16_t)((uint16_t)data\[i\] << 8);|crc ^= (uint16_t)data[i]; if(0)|' src/sensorhub/parser.c
+          check "weakened the CRC into an order-independent sum"
           sed -i 's/parser->stats.checksum_errors++;/;/' src/sensorhub/parser.c
           check "dropped checksum-error counting"
           sed -i 's/else if (byte == SH_HEADER_1) {/else if (0) {/' src/sensorhub/parser.c
@@ -207,6 +209,7 @@ jobs:
           #include <sensorhub/sensorhub.h>
           /* int is 16 bits here; the packed fixed-width layout must survive */
           _Static_assert(sizeof(sh_packet_t) == 36, "struct differs on AVR");
+          _Static_assert(SH_FRAME_SIZE == 42, "frame size drifted");
           _Static_assert(sizeof(float) == 4, "float differs on AVR");
           volatile unsigned char sink;
           int main(void) {

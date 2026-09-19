@@ -111,17 +111,25 @@ sh_status_t sh_analog(const sh_packet_t *packet, unsigned index, uint16_t *out)
  *  Checksum and encoding
  * ------------------------------------------------------------------ */
 
-uint8_t sh_checksum(const uint8_t *data, size_t length)
+uint16_t sh_crc16_continue(uint16_t crc, const uint8_t *data, size_t length)
 {
-    uint8_t checksum = 0;
-
-    if (data == NULL) return 0;
+    if (data == NULL) return crc;
 
     for (size_t i = 0; i < length; ++i) {
-        checksum ^= data[i];
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+
+        for (unsigned bit = 0; bit < 8u; ++bit) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u)
+                                  : (uint16_t)(crc << 1);
+        }
     }
 
-    return checksum;
+    return crc;
+}
+
+uint16_t sh_crc16(const uint8_t *data, size_t length)
+{
+    return sh_crc16_continue(0xFFFFu, data, length);
 }
 
 sh_status_t sh_encode_frame(const sh_packet_t *packet, uint8_t *buffer,
@@ -136,9 +144,13 @@ sh_status_t sh_encode_frame(const sh_packet_t *packet, uint8_t *buffer,
     buffer[3] = (uint8_t)SH_PAYLOAD_SIZE;
     memcpy(buffer + 4, packet, SH_PAYLOAD_SIZE);
 
-    /* The checksum covers fmt and len too, so a corrupted length byte cannot
-       quietly reframe the stream and still validate. */
-    buffer[4 + SH_PAYLOAD_SIZE] = sh_checksum(buffer + 2, SH_PAYLOAD_SIZE + 2u);
+    /* The CRC covers fmt and len as well as the payload, so a corrupted
+       length byte cannot quietly reframe the stream and still validate. */
+    {
+        uint16_t crc = sh_crc16(buffer + 2, SH_PAYLOAD_SIZE + 2u);
+        buffer[4 + SH_PAYLOAD_SIZE] = (uint8_t)(crc & 0xFFu);
+        buffer[5 + SH_PAYLOAD_SIZE] = (uint8_t)(crc >> 8);
+    }
 
     if (written != NULL) *written = SH_FRAME_SIZE;
     return SH_OK;
@@ -240,20 +252,32 @@ sh_status_t sh_parser_feed(sh_parser_t *parser, uint8_t byte, sh_packet_t *out)
     case SH_READ_PAYLOAD:
         parser->payload[parser->payload_index++] = byte;
         if (parser->payload_index == (size_t)parser->length) {
-            parser->state = SH_READ_CHECKSUM;
+            parser->state = SH_READ_CRC_LO;
         }
         break;
 
-    case SH_READ_CHECKSUM: {
-        uint8_t expected;
+    case SH_READ_CRC_LO:
+        parser->crc_lo = byte;
+        parser->state = SH_READ_CRC_HI;
+        break;
+
+    case SH_READ_CRC_HI: {
+        uint16_t received = (uint16_t)(((uint16_t)byte << 8) | parser->crc_lo);
+        uint16_t expected;
+        uint8_t header[2];
 
         parser->state = SH_WAIT_HEADER_1;
 
-        /* Recompute over fmt, len, and the payload, matching the encoder. */
-        expected = (uint8_t)(parser->format ^ parser->length);
-        expected ^= sh_checksum(parser->payload, (size_t)parser->length);
+        /* Recompute over fmt, len, and the payload, matching the encoder.
+           Feeding the two header fields through the same routine keeps one
+           definition of the polynomial rather than two. */
+        header[0] = parser->format;
+        header[1] = parser->length;
+        expected = sh_crc16_continue(sh_crc16(header, sizeof(header)),
+                                     parser->payload,
+                                     (size_t)parser->length);
 
-        if (expected == byte) {
+        if (expected == received) {
             memcpy(out, parser->payload, SH_PAYLOAD_SIZE);
             parser->stats.packets++;
             note_sequence(parser, out->sequence);

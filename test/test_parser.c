@@ -75,8 +75,8 @@ static int feed_all(sh_parser_t *parser, const uint8_t *data, size_t len,
 static void test_sizes_are_the_wire_contract(void)
 {
     CHECK(sizeof(sh_packet_t) == 36, "payload must stay 36 bytes");
-    CHECK(SH_FRAME_SIZE == 41, "frame must stay 41 bytes");
-    CHECK(SH_FRAME_OVERHEAD == 5, "overhead is header, fmt, len, checksum");
+    CHECK(SH_FRAME_SIZE == 42, "frame must stay 42 bytes");
+    CHECK(SH_FRAME_OVERHEAD == 6, "overhead is header, fmt, len, 2 CRC bytes");
 }
 
 static void test_roundtrip(void)
@@ -158,7 +158,7 @@ static void test_bad_checksum_is_counted_not_silent(void)
         last = sh_parser_feed(&parser, frame[i], &out);
     }
 
-    CHECK(last == SH_E_CHECKSUM, "a bad checksum must report SH_E_CHECKSUM");
+    CHECK(last == SH_E_CHECKSUM, "a bad CRC must report SH_E_CHECKSUM");
     CHECK(parser.stats.checksum_errors == 1, "and must be counted");
     CHECK(parser.stats.packets == 0, "and must not yield a packet");
 }
@@ -238,10 +238,13 @@ static void test_unknown_format_is_refused_not_decoded(void)
 
     encode(&in, frame);
     frame[2] = 0x02u; /* a future format */
-    /* fix the checksum so this is purely a version rejection, not a
-       corruption that would be caught anyway */
-    frame[SH_FRAME_SIZE - 1] =
-        (uint8_t)(frame[2] ^ frame[3]) ^ sh_checksum(frame + 4, SH_PAYLOAD_SIZE);
+    /* fix the CRC so this is purely a version rejection, not a corruption
+       that would have been caught anyway */
+    {
+        uint16_t crc = sh_crc16(frame + 2, SH_PAYLOAD_SIZE + 2u);
+        frame[SH_FRAME_SIZE - 2] = (uint8_t)(crc & 0xFFu);
+        frame[SH_FRAME_SIZE - 1] = (uint8_t)(crc >> 8);
+    }
 
     sh_parser_init(&parser);
     for (size_t i = 0; i < sizeof(frame); ++i) {
@@ -266,13 +269,14 @@ static void test_length_lets_us_skip_a_newer_sender(void)
     sh_parser_t parser;
     size_t n = 0;
 
-    /* A future frame: format 2, payload 50 bytes. */
+    /* A future frame: format 2, payload 50 bytes, then its two CRC bytes. */
     buf[n++] = SH_HEADER_1;
     buf[n++] = SH_HEADER_2;
     buf[n++] = 0x02u;
     buf[n++] = 50u;
     for (int i = 0; i < 50; ++i) buf[n++] = (uint8_t)i;
-    buf[n++] = 0x00u; /* its checksum, whatever it is */
+    buf[n++] = 0x00u;
+    buf[n++] = 0x00u;
 
     /* Then a frame we do understand. */
     encode(&in, buf + n);
@@ -465,7 +469,8 @@ static void test_null_arguments_are_safe(void)
           "NULL buffer");
     CHECK(sh_digital_in(NULL, 0, &v) == SH_E_NULL, "NULL packet to accessor");
     CHECK(sh_digital_in(&p, 0, NULL) == SH_E_NULL, "NULL out to accessor");
-    CHECK(sh_checksum(NULL, 10) == 0, "NULL checksum input");
+    CHECK(sh_crc16(NULL, 10) == 0xFFFFu,
+          "NULL CRC input returns the initial value, not garbage");
 }
 
 static void test_status_strings_exist(void)
@@ -518,7 +523,7 @@ static void test_wire_format_is_frozen(void)
         0x0D,                   /* digital_in     0b00001101     */
         0x02,                   /* digital_out    0b00000010     */
         0x07, 0x00,             /* sequence       7              */
-        0x84                    /* checksum over fmt, len, payload */
+        0x51, 0xF1              /* CRC-16 over fmt, len, payload, LE */
     };
 
     sh_packet_t in = sample_packet();
@@ -537,6 +542,115 @@ static void test_wire_format_is_frozen(void)
     CHECK(feed_all(&parser, golden, sizeof(golden), &out) == 1,
           "the frozen frame must still decode");
     CHECK(packets_equal(&in, &out), "decoded golden frame should match");
+}
+
+
+/* ---- the corruptions an XOR checksum could not see ---- */
+
+/* Feed a whole frame and report whether it was accepted. */
+static bool frame_accepted(const uint8_t *frame, size_t len)
+{
+    sh_parser_t parser;
+    sh_packet_t out;
+
+    sh_parser_init(&parser);
+    for (size_t i = 0; i < len; ++i) {
+        if (sh_parser_feed(&parser, frame[i], &out) == SH_OK) return true;
+    }
+    return false;
+}
+
+static void test_two_flips_in_the_same_bit_position(void)
+{
+    /*
+     * The reason this frame carries a CRC rather than an XOR sum.
+     *
+     * Two bit flips in the same bit position cancel exactly under XOR, so a
+     * byte-sum accepted 100% of these in a two-million-frame simulation. It
+     * is not an exotic case either: a ground bounce or a supply glitch
+     * disturbing one data line flips the same bit in consecutive bytes,
+     * which is exactly what an ignition system produces.
+     */
+    sh_packet_t in = sample_packet();
+    uint8_t frame[SH_FRAME_SIZE];
+    unsigned accepted = 0;
+
+    for (unsigned bit = 0; bit < 8u; ++bit) {
+        for (unsigned i = 4; i < 4u + SH_PAYLOAD_SIZE - 1u; ++i) {
+            encode(&in, frame);
+            frame[i] ^= (uint8_t)(1u << bit);
+            frame[i + 1] ^= (uint8_t)(1u << bit);
+            if (frame_accepted(frame, sizeof(frame))) accepted++;
+        }
+    }
+
+    CHECK(accepted == 0,
+          "paired same-bit flips must all be caught, %u slipped through",
+          accepted);
+}
+
+static void test_swapped_bytes(void)
+{
+    /*
+     * The other one. XOR is order-independent, so swapping two payload bytes
+     * is completely invisible to it: also 100% undetected in simulation.
+     */
+    sh_packet_t in = sample_packet();
+    uint8_t frame[SH_FRAME_SIZE];
+    unsigned accepted = 0;
+    unsigned tried = 0;
+
+    for (unsigned i = 4; i < 4u + SH_PAYLOAD_SIZE; ++i) {
+        for (unsigned j = i + 1u; j < 4u + SH_PAYLOAD_SIZE; ++j) {
+            uint8_t tmp;
+
+            encode(&in, frame);
+            if (frame[i] == frame[j]) continue; /* a no-op swap */
+
+            tmp = frame[i];
+            frame[i] = frame[j];
+            frame[j] = tmp;
+            tried++;
+
+            if (frame_accepted(frame, sizeof(frame))) accepted++;
+        }
+    }
+
+    CHECK(tried > 100, "should have tried a decent number of swaps, got %u",
+          tried);
+    CHECK(accepted == 0, "swapped bytes must all be caught, %u slipped through",
+          accepted);
+}
+
+static void test_every_single_bit_flip_is_caught(void)
+{
+    /* Across the whole frame, including the header fields and the CRC. */
+    sh_packet_t in = sample_packet();
+    uint8_t frame[SH_FRAME_SIZE];
+    unsigned accepted = 0;
+
+    for (unsigned i = 2; i < SH_FRAME_SIZE; ++i) {
+        for (unsigned bit = 0; bit < 8u; ++bit) {
+            encode(&in, frame);
+            frame[i] ^= (uint8_t)(1u << bit);
+            if (frame_accepted(frame, sizeof(frame))) accepted++;
+        }
+    }
+
+    CHECK(accepted == 0, "every single-bit flip must be caught, %u were not",
+          accepted);
+}
+
+static void test_crc_matches_the_reference_vector(void)
+{
+    /* CRC-16-CCITT (0x1021, init 0xFFFF) over "123456789" is 0x29B1. This is
+       the standard check value; if it fails, the polynomial or the init
+       constant drifted. */
+    static const uint8_t check[] = "123456789";
+
+    CHECK(sh_crc16(check, sizeof(check) - 1u) == 0x29B1u,
+          "CRC-16-CCITT check value must be 0x29B1, got 0x%04X",
+          (unsigned)sh_crc16(check, sizeof(check) - 1u));
 }
 
 int main(void)
@@ -564,6 +678,11 @@ int main(void)
     test_encode_refuses_a_short_buffer();
     test_null_arguments_are_safe();
     test_status_strings_exist();
+
+    test_crc_matches_the_reference_vector();
+    test_every_single_bit_flip_is_caught();
+    test_two_flips_in_the_same_bit_position();
+    test_swapped_bytes();
 
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
