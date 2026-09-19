@@ -90,38 +90,36 @@ void sh_serial_close(int fd)
     }
 }
 
-static bool read_byte(int fd, uint8_t *value)
-{
-    ssize_t count;
-
-    count = read(fd, value, 1);
-
-    if (count == 0) {
-        errno = 0; /* clean EOF, distinguish from a real error */
-    }
-
-    /* EINTR is reported rather than retried. A caller with a shutdown flag
-       needs a chance to look at it; swallowing the signal here is what makes
-       a serial tool impossible to Ctrl-C. */
-    return count == 1;
-}
-
-bool sh_serial_read_packet(int fd, sh_parser_t *parser, sh_packet_t *out)
+sh_status_t sh_serial_read_packet(int fd, sh_parser_t *parser,
+                                  sh_packet_t *out)
 {
     uint8_t byte;
 
-    if (parser == NULL || out == NULL) {
-        errno = EINVAL;
-        return false;
-    }
+    if (parser == NULL || out == NULL) return SH_E_NULL;
 
-    while (read_byte(fd, &byte)) {
-        if (sh_parser_feed(parser, byte, out)) {
-            return true;
+    for (;;) {
+        ssize_t count = read(fd, &byte, 1);
+
+        if (count == 1) {
+            sh_status_t status = sh_parser_feed(parser, byte, out);
+
+            /* Keep reading through recoverable framing errors: a single bad
+               packet is not a reason to hand the caller a failure and make
+               it decide whether to loop. Only a completed packet or an I/O
+               condition ends this call. */
+            if (status == SH_OK) return SH_OK;
+            continue;
         }
-    }
 
-    return false;
+        if (count == 0) return SH_E_CLOSED;
+
+        /* EINTR is surfaced rather than retried so a caller with a shutdown
+           flag gets a chance to look at it. Retrying here is what makes a
+           serial tool impossible to Ctrl-C. */
+        if (errno == EINTR) return SH_E_INTERRUPTED;
+
+        return SH_E_IO;
+    }
 }
 
 #else  /* not POSIX */

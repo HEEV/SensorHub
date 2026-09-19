@@ -40,27 +40,42 @@ static void install_handler(int signum)
 
 static void print_packet(const sh_packet_t *packet, const sh_stats_t *stats)
 {
+    char digital[18];
+    unsigned i;
+
+    /* inputs then outputs, most significant channel on the left so the
+       string reads the way the bitfield is written */
+    for (i = 0; i < 8; ++i) {
+        bool v = false;
+        (void)sh_digital_in(packet, 7 - i, &v);
+        digital[i] = v ? '1' : '0';
+    }
+    digital[8] = ' ';
+    for (i = 0; i < 8; ++i) {
+        bool v = false;
+        (void)sh_digital_out(packet, 7 - i, &v);
+        digital[9 + i] = v ? '1' : '0';
+    }
+    digital[17] = '\0';
+
     printf("\r\x1b[2K"
-           "speed=%.2f mph"
-           " | air=%.2f"
-           " | engine=%.1fF"
-           " | rad=%.1fF"
-           " | ch=%u%u%u%u%u"
+           "#%u speed=%.2f air=%.2f"
+           " | eng=%.1fF rad=%.1fF"
            " | A0=%u"
-           " | ok=%llu bad=%llu resync=%llu",
+           " | in/out=%s"
+           " | ok=%llu bad=%llu fmt=%llu resync=%llu lost=%llu",
+           (unsigned)packet->sequence,
            (double)packet->speed,
            (double)packet->airspeed,
-           (double)packet->engineTemp,
-           (double)packet->radTemp,
-           (unsigned)packet->channel0,
-           (unsigned)packet->channel1,
-           (unsigned)packet->channel2,
-           (unsigned)packet->channel3,
-           (unsigned)packet->channel4,
-           (unsigned)packet->channelA0,
+           (double)packet->temps[SH_TEMP_ENGINE],
+           (double)packet->temps[SH_TEMP_RADIATOR],
+           (unsigned)packet->analog[SH_ANALOG_BATTERY],
+           digital,
            (unsigned long long)stats->packets,
            (unsigned long long)stats->checksum_errors,
-           (unsigned long long)stats->resyncs);
+           (unsigned long long)stats->format_errors,
+           (unsigned long long)stats->resyncs,
+           (unsigned long long)stats->dropped);
 
     fflush(stdout);
 }
@@ -70,6 +85,7 @@ int main(int argc, char **argv)
     const char *device = (argc > 1) ? argv[1] : SH_DEFAULT_PORT;
     sh_parser_t parser;
     sh_packet_t packet;
+    sh_status_t status;
     int fd;
 
     signal(SIGPIPE, SIG_IGN);
@@ -90,26 +106,29 @@ int main(int argc, char **argv)
     while (!g_stop) {
         memset(&packet, 0, sizeof(packet));
 
-        if (!sh_serial_read_packet(fd, &parser, &packet)) {
-            if (errno == EINTR) {
-                continue; /* a signal; the while condition rechecks g_stop */
-            }
-            if (errno != 0) {
-                fprintf(stderr, "\nserial read: %s\n", strerror(errno));
-            }
-            else {
-                fprintf(stderr, "\nserial connection closed\n");
-            }
+        status = sh_serial_read_packet(fd, &parser, &packet);
+
+        if (status == SH_E_INTERRUPTED) {
+            continue; /* a signal; the while condition rechecks g_stop */
+        }
+
+        if (status != SH_OK) {
+            fprintf(stderr, "\n%s", sh_strstatus(status));
+            if (status == SH_E_IO) fprintf(stderr, ": %s", strerror(errno));
+            fprintf(stderr, "\n");
             break;
         }
 
         print_packet(&packet, &parser.stats);
     }
 
-    printf("\n%llu packets, %llu checksum errors, %llu resyncs\n",
+    printf("\n%llu packets, %llu bad checksums, %llu unknown formats, "
+           "%llu resyncs, %llu never arrived\n",
            (unsigned long long)parser.stats.packets,
            (unsigned long long)parser.stats.checksum_errors,
-           (unsigned long long)parser.stats.resyncs);
+           (unsigned long long)parser.stats.format_errors,
+           (unsigned long long)parser.stats.resyncs,
+           (unsigned long long)parser.stats.dropped);
 
     sh_serial_close(fd);
     return 0;

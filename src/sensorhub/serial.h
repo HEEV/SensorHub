@@ -26,9 +26,10 @@ extern "C" {
 /*
  * Open and configure a port at 115200 8N1 raw.
  *
- * Returns a file descriptor, or -1 with errno set.  Close it with
- * sh_serial_close().  Do not reopen in a retry loop without a delay: each
- * open can reset the Nano.
+ * Returns a file descriptor, or -1 with errno set. Close it with
+ * sh_serial_close(). Do not reopen in a retry loop without a delay: each open
+ * can reset the Nano through its DTR auto-reset circuit, which costs a couple
+ * of seconds of telemetry and re-runs the airspeed zeroing.
  */
 int sh_serial_open(const char *device);
 
@@ -38,19 +39,23 @@ void sh_serial_close(int fd);
 /*
  * Block until the next valid packet arrives, feeding bytes through parser.
  *
- * Returns true with *out populated.  Returns false on EOF, on a read error,
- * or when a signal interrupted the read:
+ *   SH_OK            *out holds a packet
+ *   SH_E_CLOSED      clean EOF; on a serial port the adapter was unplugged
+ *   SH_E_INTERRUPTED a signal arrived; check your stop flag and call again
+ *   SH_E_IO          a real read error, see errno
+ *   SH_E_NULL        parser or out was NULL
  *
- *   errno == 0      clean EOF; on a serial port, the adapter was unplugged
- *   errno == EINTR  a signal arrived; check your shutdown flag and call again
- *   otherwise       a real error
+ * Recoverable framing errors do not end the call. A bad checksum or an
+ * unknown format is counted in parser->stats and reading continues, because
+ * one corrupt packet is not a reason to make every caller write a retry loop.
  *
- * EINTR is surfaced rather than retried internally so that a caller can
+ * SH_E_INTERRUPTED is surfaced rather than retried internally so a caller can
  * actually be interrupted. Install handlers with sigaction() and no
- * SA_RESTART if you want Ctrl-C to work; plain signal() sets SA_RESTART on
- * most platforms, which prevents read() from ever returning EINTR.
+ * SA_RESTART if you want Ctrl-C to work: plain signal() sets SA_RESTART on
+ * most platforms, which stops read() ever returning EINTR.
  */
-bool sh_serial_read_packet(int fd, sh_parser_t *parser, sh_packet_t *out);
+sh_status_t sh_serial_read_packet(int fd, sh_parser_t *parser,
+                                  sh_packet_t *out);
 
 #ifdef __cplusplus
 }
