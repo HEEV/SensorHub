@@ -127,7 +127,7 @@ jobs:
           check "dropped checksum-error counting"
           sed -i 's/else if (byte == SH_HEADER_1) {/else if (0) {/' src/sensorhub/parser.c
           check "broke repeated-header handling"
-          sed -i 's/if (channel > SH_DIGITAL_MAX)      return SH_E_RANGE;/;/' src/sensorhub/parser.c
+          sed -i 's/if (channel > SH_DIGITAL_MAX) return SH_E_RANGE;/;/' src/sensorhub/parser.c
           check "dropped the digital channel bounds check"
           sed -i 's/if (buffer_size < SH_FRAME_SIZE)      return SH_E_SPACE;/;/' src/sensorhub/parser.c
           check "dropped the encode buffer size check"

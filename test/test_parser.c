@@ -421,17 +421,14 @@ static void test_out_of_range_is_an_error_not_a_read(void)
 {
     sh_packet_t p = sample_packet();
     bool v;
-    float f;
     uint16_t a;
 
     CHECK(sh_digital_in(&p, 8, &v) == SH_E_RANGE, "channel 8 is out of range");
     CHECK(sh_digital_out(&p, 99, &v) == SH_E_RANGE, "so is 99");
     CHECK(sh_set_digital_in(&p, 8, true) == SH_E_RANGE, "and for writes");
-    CHECK(sh_temp(&p, SH_TEMP_COUNT, &f) == SH_E_RANGE, "temp index bound");
     CHECK(sh_analog(&p, SH_ANALOG_COUNT, &a) == SH_E_RANGE, "analog bound");
 
-    CHECK(sh_temp(&p, SH_TEMP_ENGINE, &f) == SH_OK && f == 180.0f,
-          "a valid temp index still works");
+    CHECK(p.temps[SH_TEMP_ENGINE] == 180.0f, "temps read directly");
     CHECK(sh_analog(&p, SH_ANALOG_BATTERY, &a) == SH_OK && a == 812,
           "a valid analog index still works");
 }

@@ -12,23 +12,12 @@
  *          sender and stay framed, instead of desynchronising.
  *   crc16  CRC-16-CCITT over fmt, len, and the payload, little-endian.
  *
- * The CRC is not a byte-sum. An XOR checksum misses two corruptions that a
- * car produces for real: two bit flips in the same bit position cancel
- * exactly, and swapped bytes are invisible to an order-independent sum. Both
- * were measured at 100% undetected. CRC-16 catches both, plus every burst up
- * to 16 bits, for 32 bytes of flash on an ATmega328p.
+ * CRC, not a byte-sum: XOR misses paired same-bit flips and swapped bytes
+ * entirely. Both were 100% undetected in simulation.
  *
- * The version and length bytes are the difference between "we changed the
- * format and everything broke loudly" and "we changed the format and the car
- * logged plausible nonsense for a season". They cost two bytes on a link
- * running at 7% utilisation.
- *
- * PARSING IS SEPARATE FROM I/O
- *
- * sh_parser_feed() takes one byte and never touches a file descriptor, so the
- * framing can be tested on any machine with no car attached. The serial
- * helpers in <sensorhub/serial.h> are a convenience for callers that do have
- * hardware.
+ * sh_parser_feed() takes one byte and touches no file descriptor, so the
+ * framing is testable with no car attached. Serial helpers live in
+ * <sensorhub/serial.h>.
  */
 
 #ifndef SENSORHUB_H
@@ -69,14 +58,6 @@ extern "C" {
  *  The packet
  * ------------------------------------------------------------------ */
 
-/*
- * Digital channels are bits, not bytes: a switch carries one bit of
- * information and sixteen of them fit in the space two bytes used to take.
- *
- * Outputs are reported as well as inputs. The firmware drives a radiator fan
- * and a water pump, and until now their state appeared nowhere in telemetry,
- * so you could not display or log what the car was doing to itself.
- */
 typedef struct __attribute__((packed)) {
     float speed;    /* mph, from the wheel interrupt   */
     float airspeed; /* mph, pitot, zeroed at startup   */
@@ -112,15 +93,8 @@ typedef struct __attribute__((packed)) {
  *  Status
  * ------------------------------------------------------------------ */
 
-/*
- * Every call that can fail returns one of these. SH_OK is zero, so the
- * common shape reads naturally:
- *
- *     if (sh_parser_feed(&parser, byte, &packet) == SH_OK) { ... }
- *
- * SH_INCOMPLETE is not an error. It is the usual answer, returned for every
- * byte that did not happen to complete a packet.
- */
+/* SH_OK is zero, so `== SH_OK` reads naturally. SH_INCOMPLETE is not an
+   error; it is the answer for most bytes. */
 typedef enum {
     SH_OK = 0,       /* a packet is ready                          */
     SH_INCOMPLETE,   /* byte consumed, nothing complete yet        */
@@ -168,9 +142,9 @@ sh_status_t sh_set_digital_in(sh_packet_t *packet, unsigned channel,
 sh_status_t sh_set_digital_out(sh_packet_t *packet, unsigned channel,
                                bool value);
 
-/* Bounds-checked reads for the array slots, so an out-of-range index is an
-   error rather than whatever was next in memory. */
-sh_status_t sh_temp(const sh_packet_t *packet, unsigned index, float *out);
+/* Bounds-checked, for callers whose index comes from runtime configuration
+   rather than a constant. Read packet->temps[SH_TEMP_ENGINE] directly when the
+   index is known at compile time; there is no accessor for that. */
 sh_status_t sh_analog(const sh_packet_t *packet, unsigned index,
                       uint16_t *out);
 
@@ -178,23 +152,14 @@ sh_status_t sh_analog(const sh_packet_t *packet, unsigned index,
  *  Link statistics
  * ------------------------------------------------------------------ *
  *
- * A link that is losing packets shows up here long before it shows up on the
- * dashboard. The three counters fail differently and are worth reading
- * separately:
+ * The counters fail differently and are worth reading separately:
+ *   checksum_errors   electrical: noise, a marginal cable, a bad ground
+ *   resyncs           the sender is being interrupted mid-frame
+ *   dropped           packets never arrived; a CRC cannot tell you this
  *
- *   checksum_errors rising   electrical: noise, a marginal cable, a bad ground
- *   resyncs rising           the sender is being interrupted mid-frame
- *   dropped rising           packets never arrived at all; the receiver is
- *                            not keeping up, or the sender is restarting
- *
- * Width is configurable because this header also compiles for an ATmega328p,
- * where 64-bit counters cost RAM a Nano does not have and every increment is
- * a slow multi-word add. The AVR default is 32-bit rather than 16: at roughly
- * 40 packets a second, 16 bits wraps in under half an hour, and a diagnostic
- * counter that quietly lies is worse than a larger one.
- *
- * Note this changes sizeof(sh_stats_t), so everything linked together must
- * agree on it.
+ * 32-bit on AVR, not 16: at 40 packets a second 16 bits wraps in under half
+ * an hour. Changing the width changes sizeof(sh_stats_t), so everything
+ * linked together must agree on it.
  */
 #ifndef SH_COUNTER_BITS
 #  if defined(__AVR__) || defined(SH_EMBEDDED)
@@ -262,9 +227,7 @@ void sh_parser_init(sh_parser_t *parser);
  *                  uses the length byte to skip it cleanly and carries on
  *   SH_E_NULL      parser or out was NULL
  *
- * Errors are reported, not thrown: the parser stays usable and keeps
- * counting. A caller that only wants packets can compare against SH_OK and
- * read parser->stats occasionally.
+ * Errors are reported, not thrown; the parser stays usable and keeps counting.
  */
 sh_status_t sh_parser_feed(sh_parser_t *parser, uint8_t byte,
                            sh_packet_t *out);
@@ -273,14 +236,8 @@ sh_status_t sh_parser_feed(sh_parser_t *parser, uint8_t byte,
  *  Encoding
  * ------------------------------------------------------------------ */
 
-/*
- * CRC-16-CCITT, polynomial 0x1021, initial value 0xFFFF, no final xor.
- *
- * Exposed so tests and any other transmitter need not duplicate it. The
- * bitwise form is deliberate: a 256-entry table would be faster and cost 512
- * bytes of flash on a part that has 30KB, to save time this loop does not
- * need at 20 packets a second.
- */
+/* CRC-16-CCITT, poly 0x1021, init 0xFFFF, no final xor. Bitwise on purpose:
+   a 256-entry table costs 512 bytes of flash to save time nobody needs. */
 uint16_t sh_crc16(const uint8_t *data, size_t length);
 
 /* Resume a CRC over a second run of bytes. Lets the receiver cover the
@@ -288,17 +245,12 @@ uint16_t sh_crc16(const uint8_t *data, size_t length);
    one contiguous buffer first. */
 uint16_t sh_crc16_continue(uint16_t crc, const uint8_t *data, size_t length);
 
-/*
- * Serialise a packet into a complete frame.
- *
- * buffer must have room for at least SH_FRAME_SIZE bytes; pass its real size
- * in buffer_size and the function will refuse rather than overrun. On success
- * *written holds the frame length. written may be NULL if you do not care.
- *
- *   SH_OK       frame written
- *   SH_E_SPACE  buffer_size was too small
- *   SH_E_NULL   packet or buffer was NULL
- */
+/* Serialise into a frame. Pass the real buffer size; too small is refused,
+   not overrun. written may be NULL.
+
+     SH_OK       frame written, *written is its length
+     SH_E_SPACE  buffer_size < SH_FRAME_SIZE
+     SH_E_NULL   packet or buffer was NULL */
 sh_status_t sh_encode_frame(const sh_packet_t *packet, uint8_t *buffer,
                             size_t buffer_size, size_t *written);
 
