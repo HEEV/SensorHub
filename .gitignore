@@ -1,0 +1,9 @@
+# CMake build output
+build/
+
+# Arduino build output
+*.elf
+*.hex
+
+# macOS
+.DS_Store

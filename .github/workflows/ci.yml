@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: gcc }
+          - { os: ubuntu-latest, cc: clang }
+          - { os: macos-latest,  cc: clang }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${{ matrix.cc }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: End-to-end against a fake Arduino on a pty
+        # covers what the unit tests cannot: termios setup, blocking reads,
+        # and signal handling. it caught a monitor that could not be Ctrl-C'd.
+        run: python3 test/test_serial_pty.py build/sensorhub-monitor
+
+  warnings:
+    name: -Wall -Wextra -Werror
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [ gcc, clang ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+                -DCMAKE_C_FLAGS="-Wall -Wextra -Werror"
+      - name: Build
+        run: cmake --build build -j
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -g"
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  cross-aarch64:
+    # this library's whole job is to run on the Pi 5, so prove it cross-compiles
+    # for one before trusting an x86 green tick
+    name: cross-compile for the Pi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_SYSTEM_NAME=Linux \
+                -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+                -DCMAKE_C_FLAGS="-Wall -Wextra -Werror"
+      - name: Build
+        run: cmake --build build -j
+      - name: Run the tests under emulation
+        run: qemu-aarch64 -L /usr/aarch64-linux-gnu ./build/test_parser
+
+  mutation:
+    # a framing test that cannot fail is worse than no test, because it
+    # launders a guess into a green tick. break the parser four ways and
+    # require the suite to notice every time.
+    name: the tests must be able to fail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and confirm the suite passes clean
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j
+          ./build/test_parser
+      - name: Each mutation must be caught
+        run: |
+          set -u
+          cp src/sensorhub/parser.c /tmp/parser.orig
+          fail=0
+          check () {
+            cmake --build build -j >/dev/null 2>&1
+            if ./build/test_parser >/dev/null 2>&1; then
+              echo "NOT CAUGHT: $1"
+              fail=1
+            else
+              echo "caught: $1"
+            fi
+            cp /tmp/parser.orig src/sensorhub/parser.c
+          }
+          sed -i 's/if (parser->format != SH_FORMAT_CURRENT) {/if (0) {/' src/sensorhub/parser.c
+          check "accepted any format version"
+          sed -i 's/parser->stats.dropped += gap;/;/' src/sensorhub/parser.c
+          check "stopped counting dropped packets"
+          sed -i 's/gap < 1000u/gap < 65535u/' src/sensorhub/parser.c
+          check "treated a sender restart as a flood of drops"
+          sed -i 's/sh_crc16(buffer + 2, SH_PAYLOAD_SIZE + 2u)/sh_crc16(buffer + 4, SH_PAYLOAD_SIZE)/' src/sensorhub/parser.c
+          check "covered the payload only, not fmt and len"
+          sed -i 's|crc ^= (uint16_t)((uint16_t)data\[i\] << 8);|crc ^= (uint16_t)data[i]; if(0)|' src/sensorhub/parser.c
+          check "weakened the CRC into an order-independent sum"
+          sed -i 's/parser->stats.checksum_errors++;/;/' src/sensorhub/parser.c
+          check "dropped checksum-error counting"
+          sed -i 's/else if (byte == SH_HEADER_1) {/else if (0) {/' src/sensorhub/parser.c
+          check "broke repeated-header handling"
+          sed -i 's/if (channel > SH_DIGITAL_MAX)      return SH_E_RANGE;/;/' src/sensorhub/parser.c
+          check "dropped the digital channel bounds check"
+          sed -i 's/if (buffer_size < SH_FRAME_SIZE)      return SH_E_SPACE;/;/' src/sensorhub/parser.c
+          check "dropped the encode buffer size check"
+          cmake --build build -j >/dev/null 2>&1
+          exit $fail
+
+  consumer:
+    # what pulling this into CarComputer actually looks like
+    name: add_subdirectory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: SensorHub
+      - name: Write a consumer that uses only the public header
+        run: |
+          cat > CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer LANGUAGES C)
+          add_subdirectory(SensorHub)
+          add_executable(consumer main.c)
+          target_link_libraries(consumer PRIVATE sensorhub)
+          CMAKE
+          cat > main.c <<'C'
+          #include <sensorhub/sensorhub.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main (void) {
+              sh_parser_t parser;
+              sh_packet_t in, out;
+              uint8_t frame[SH_FRAME_SIZE];
+              memset(&in, 0, sizeof(in));
+              in.speed = 12.5f;
+              in.temps[SH_TEMP_ENGINE] = 190.0f;
+              sh_set_digital_in(&in, 2, true);
+              if (sh_encode_frame(&in, frame, sizeof(frame), NULL) != SH_OK)
+                  return 1;
+              sh_parser_init(&parser);
+              for (size_t i = 0; i < sizeof(frame); ++i) {
+                  if (sh_parser_feed(&parser, frame[i], &out) == SH_OK) {
+                      bool ch2 = false;
+                      sh_digital_in(&out, 2, &ch2);
+                      printf("speed=%.1f ch2=%d\n", (double) out.speed, (int) ch2);
+                      return (out.speed == 12.5f && ch2) ? 0 : 1;
+                  }
+              }
+              return 1;
+          }
+          C
+      - name: Build and run
+        run: |
+          cmake -S . -B build
+          cmake --build build -j
+          ./build/consumer
+      - name: Private sources must not be reachable
+        run: |
+          printf '#include "parser.c"\nint main(){}\n' > bad.c
+          if cc -std=c11 -ISensorHub/src -c bad.c -o /dev/null 2>/dev/null; then
+            echo "src/ is reachable from a consumer's include path"
+            exit 1
+          fi
+          echo "src/ correctly private"
+
+  arduino:
+    # this header also ships as an Arduino library and compiles for the
+    # ATmega328p, where int is 16 bits. the firmware depends on that, so
+    # prove it here rather than finding out at flash time.
+    name: compiles for the Nano
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install avr-gcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-avr avr-libc binutils-avr
+      - name: Header and encoder must build for AVR
+        run: |
+          cat > /tmp/avr_probe.c <<'C'
+          #include <sensorhub/sensorhub.h>
+          /* int is 16 bits here; the packed fixed-width layout must survive */
+          _Static_assert(sizeof(sh_packet_t) == 36, "struct differs on AVR");
+          _Static_assert(SH_FRAME_SIZE == 42, "frame size drifted");
+          _Static_assert(sizeof(float) == 4, "float differs on AVR");
+          volatile unsigned char sink;
+          int main(void) {
+              sh_packet_t p = {0};
+              uint8_t f[SH_FRAME_SIZE];
+              size_t n = 0;
+              sh_set_digital_out(&p, 1, true);
+              if (sh_encode_frame(&p, f, sizeof(f), &n) != SH_OK) return 1;
+              sink = f[n - 1];
+              return 0;
+          }
+          C
+          avr-gcc -mmcu=atmega328p -Os -std=c11 -Wall -Wextra -Werror \
+                  -ffunction-sections -fdata-sections -Wl,--gc-sections \
+                  -Isrc /tmp/avr_probe.c src/sensorhub/parser.c -o /tmp/avr_probe.elf
+          avr-size /tmp/avr_probe.elf
+
+      - name: It must also build as C++, since .ino files are C++
+        run: |
+          printf '#include <SensorHub.h>\nstatic_assert(sizeof(sh_packet_t)==36,"");\nint main(){return 0;}\n' > /tmp/probe.cpp
+          avr-g++ -mmcu=atmega328p -Os -std=gnu++17 -Wall -Wextra \
+                  -Isrc -c /tmp/probe.cpp -o /tmp/probe.o
+
+      - name: The POSIX transport must compile away to nothing on AVR
+        run: |
+          avr-gcc -mmcu=atmega328p -Os -std=c11 -Isrc \
+                  -c src/sensorhub/serial.c -o /tmp/serial_avr.o
+          size=$(avr-size /tmp/serial_avr.o | awk 'NR==2{print $1+$2+$3}')
+          echo "serial.c contributes $size bytes on AVR"
+          test "$size" = "0"
