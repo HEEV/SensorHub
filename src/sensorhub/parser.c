@@ -49,53 +49,43 @@ bool sh_failed(sh_status_t status)
 
 #define SH_DIGITAL_MAX 7u
 
-sh_status_t sh_digital_in(const sh_packet_t *packet, unsigned channel,
-                          bool *out)
+static sh_status_t bit_get(uint8_t field, unsigned channel, bool *out)
 {
-    if (packet == NULL || out == NULL) return SH_E_NULL;
-    if (channel > SH_DIGITAL_MAX)      return SH_E_RANGE;
-
-    *out = ((packet->digital_in >> channel) & 1u) != 0u;
-    return SH_OK;
-}
-
-sh_status_t sh_digital_out(const sh_packet_t *packet, unsigned channel,
-                           bool *out)
-{
-    if (packet == NULL || out == NULL) return SH_E_NULL;
-    if (channel > SH_DIGITAL_MAX)      return SH_E_RANGE;
-
-    *out = ((packet->digital_out >> channel) & 1u) != 0u;
-    return SH_OK;
-}
-
-sh_status_t sh_set_digital_in(sh_packet_t *packet, unsigned channel, bool value)
-{
-    if (packet == NULL)           return SH_E_NULL;
+    if (out == NULL)              return SH_E_NULL;
     if (channel > SH_DIGITAL_MAX) return SH_E_RANGE;
 
-    if (value) packet->digital_in |= (uint8_t)(1u << channel);
-    else       packet->digital_in &= (uint8_t)~(1u << channel);
+    *out = ((field >> channel) & 1u) != 0u;
     return SH_OK;
 }
 
-sh_status_t sh_set_digital_out(sh_packet_t *packet, unsigned channel, bool value)
+static sh_status_t bit_set(uint8_t *field, unsigned channel, bool value)
 {
-    if (packet == NULL)           return SH_E_NULL;
+    if (field == NULL)            return SH_E_NULL;
     if (channel > SH_DIGITAL_MAX) return SH_E_RANGE;
 
-    if (value) packet->digital_out |= (uint8_t)(1u << channel);
-    else       packet->digital_out &= (uint8_t)~(1u << channel);
+    if (value) *field |= (uint8_t)(1u << channel);
+    else       *field &= (uint8_t)~(1u << channel);
     return SH_OK;
 }
 
-sh_status_t sh_temp(const sh_packet_t *packet, unsigned index, float *out)
+sh_status_t sh_digital_in(const sh_packet_t *p, unsigned channel, bool *out)
 {
-    if (packet == NULL || out == NULL) return SH_E_NULL;
-    if (index >= SH_TEMP_COUNT)        return SH_E_RANGE;
+    return (p == NULL) ? SH_E_NULL : bit_get(p->digital_in, channel, out);
+}
 
-    *out = packet->temps[index];
-    return SH_OK;
+sh_status_t sh_digital_out(const sh_packet_t *p, unsigned channel, bool *out)
+{
+    return (p == NULL) ? SH_E_NULL : bit_get(p->digital_out, channel, out);
+}
+
+sh_status_t sh_set_digital_in(sh_packet_t *p, unsigned channel, bool value)
+{
+    return (p == NULL) ? SH_E_NULL : bit_set(&p->digital_in, channel, value);
+}
+
+sh_status_t sh_set_digital_out(sh_packet_t *p, unsigned channel, bool value)
+{
+    return (p == NULL) ? SH_E_NULL : bit_set(&p->digital_out, channel, value);
 }
 
 sh_status_t sh_analog(const sh_packet_t *packet, unsigned index, uint16_t *out)
