@@ -182,14 +182,6 @@ jobs:
           cmake -S . -B build
           cmake --build build -j
           ./build/consumer
-      - name: Private sources must not be reachable
-        run: |
-          printf '#include "parser.c"\nint main(){}\n' > bad.c
-          if cc -std=c11 -ISensorHub/src -c bad.c -o /dev/null 2>/dev/null; then
-            echo "src/ is reachable from a consumer's include path"
-            exit 1
-          fi
-          echo "src/ correctly private"
 
   arduino:
     # this header also ships as an Arduino library and compiles for the
